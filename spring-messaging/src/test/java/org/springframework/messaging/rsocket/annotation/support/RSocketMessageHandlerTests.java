@@ -15,11 +15,25 @@
  */
 package org.springframework.messaging.rsocket.annotation.support;
 
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Map;
+import java.util.function.Consumer;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.Unpooled;
+import io.rsocket.AbstractRSocket;
+import io.rsocket.ConnectionSetupPayload;
+import io.rsocket.Payload;
+import io.rsocket.RSocket;
+import io.rsocket.SocketAcceptor;
 import io.rsocket.frame.FrameType;
+import io.rsocket.frame.SetupFrameCodec;
+import io.rsocket.metadata.WellKnownMimeType;
+import io.rsocket.util.ByteBufPayload;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -261,6 +275,66 @@ public class RSocketMessageHandlerTests {
 		Message<Object> message = MessageBuilder.createMessage("", headers.getMessageHeaders());
 
 		handler.handleNoMatch(route, message);
+	}
+
+	@Test
+	public void setupPayloadReleasedWhenMetadataIsMalformed() {
+		RSocketMessageHandler handler = new RSocketMessageHandler();
+		handler.afterPropertiesSet();
+		SocketAcceptor acceptor = handler.responder();
+
+		ConnectionSetupPayload setupPayload = createSetupPayload(malformedCompositeMetadata());
+		assertThat(setupPayload.refCnt()).isEqualTo(1);
+
+		assertThatThrownBy(() -> acceptor.accept(setupPayload, new AbstractRSocket() {}).block())
+				.hasMessageContaining("metadata is malformed");
+
+		// Only the reference owned (and released) by RSocket Java should remain
+		assertThat(setupPayload.refCnt()).isEqualTo(1);
+		setupPayload.release();
+		assertThat(setupPayload.refCnt()).isEqualTo(0);
+	}
+
+	@Test
+	public void requestPayloadReleasedWhenMetadataIsMalformed() {
+		RSocketMessageHandler handler = new RSocketMessageHandler();
+		handler.afterPropertiesSet();
+
+		ConnectionSetupPayload setupPayload = createSetupPayload(Unpooled.EMPTY_BUFFER);
+		RSocket responder = handler.responder().accept(setupPayload, new AbstractRSocket() {}).block();
+		assertThat(responder).isNotNull();
+		setupPayload.release();
+
+		testRequestPayloadReleased(responder::fireAndForget);
+		testRequestPayloadReleased(responder::requestResponse);
+		testRequestPayloadReleased(responder::requestStream);
+		testRequestPayloadReleased(responder::metadataPush);
+
+		ByteBuf data = Unpooled.copiedBuffer("data", StandardCharsets.UTF_8);
+		Payload payload = ByteBufPayload.create(data, malformedCompositeMetadata());
+		StepVerifier.create(responder.requestChannel(Flux.just(payload)))
+				.expectError()
+				.verify(Duration.ofSeconds(5));
+		assertThat(data.refCnt()).isEqualTo(0);
+	}
+
+	private static void testRequestPayloadReleased(Consumer<Payload> requestHandler) {
+		ByteBuf data = Unpooled.copiedBuffer("data", StandardCharsets.UTF_8);
+		Payload payload = ByteBufPayload.create(data, malformedCompositeMetadata());
+		assertThatThrownBy(() -> requestHandler.accept(payload)).hasMessageContaining("metadata is malformed");
+		assertThat(data.refCnt()).isEqualTo(0);
+	}
+
+	private static ConnectionSetupPayload createSetupPayload(ByteBuf metadata) {
+		Payload payload = ByteBufPayload.create(Unpooled.copiedBuffer("setup", StandardCharsets.UTF_8), metadata);
+		ByteBuf setupFrame = SetupFrameCodec.encode(ByteBufAllocator.DEFAULT, false, 1000, 10000,
+				WellKnownMimeType.MESSAGE_RSOCKET_COMPOSITE_METADATA.getString(), "text/plain", payload);
+		return ConnectionSetupPayload.create(setupFrame);
+	}
+
+	private static ByteBuf malformedCompositeMetadata() {
+		// Well-known MIME type entry declaring 16 bytes of content but carrying none
+		return Unpooled.wrappedBuffer(new byte[] {(byte) 0xFE, 0x00, 0x00, 0x10});
 	}
 
 
